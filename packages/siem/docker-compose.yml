@@ -1,0 +1,230 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: siem-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-siem}
+      POSTGRES_USER: ${POSTGRES_USER:-siem_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-SecurePassword123!}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./configs/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    networks:
+      - siem-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-siem_admin}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:alpine
+    container_name: siem-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - siem-network
+    command: redis-server --appendonly yes
+
+  lstm-api:
+    image: python:3.10-slim
+    container_name: siem-lstm
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./scripts/predict_api.py:/app/predict_api.py
+      - ./models:/models
+      - ./logs:/app/logs
+    working_dir: /app
+    command: >
+      bash -c "
+        pip install --no-cache-dir torch==2.0.1 fastapi==0.100.0 uvicorn==0.23.1 joblib==1.3.2 numpy==1.24.3 pandas==2.0.3 scikit-learn==1.3.0 &&
+        uvicorn predict_api:app --host 0.0.0.0 --port 8001
+      "
+    networks:
+      - siem-network
+    depends_on:
+      - redis
+    environment:
+      - MODEL_PATH=/models/best_model.pt
+      - SCALER_PATH=/models/feature_scaler.pkl
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+  backend-api:
+    image: python:3.10-slim
+    container_name: siem-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./scripts/backend_api.py:/app/backend_api.py
+      - ./configs:/app/configs
+    working_dir: /app
+    command: >
+      bash -c "
+        pip install --no-cache-dir fastapi==0.100.0 uvicorn==0.23.1 sqlalchemy==2.0.19 asyncpg==0.28.0 redis==5.0.1 python-dotenv==1.0.0 &&
+        uvicorn backend_api:app --host 0.0.0.0 --port 8000
+      "
+    networks:
+      - siem-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      lstm-api:
+        condition: service_started
+    environment:
+      - DB_HOST=postgres
+      - DB_PORT=5432
+      - DB_NAME=${POSTGRES_DB:-siem}
+      - DB_USER=${POSTGRES_USER:-siem_admin}
+      - DB_PASSWORD=${POSTGRES_PASSWORD:-SecurePassword123!}
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LSTM_API=http://lstm-api:8001
+
+  dashboard:
+    image: python:3.10-slim
+    container_name: siem-dashboard
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./scripts/dashboard.py:/app/dashboard.py
+    working_dir: /app
+    command: >
+      bash -c "
+        pip install --no-cache-dir streamlit==1.25.0 pandas==2.0.3 plotly==5.15.0 redis==5.0.1 requests==2.31.0 &&
+        streamlit run dashboard.py --server.port=8501 --server.address=0.0.0.0
+      "
+    networks:
+      - siem-network
+    depends_on:
+      - backend-api
+      - redis
+    environment:
+      - API_URL=http://backend-api:8000
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+  pcap-capture:
+    image: alpine:latest
+    container_name: siem-capture
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+    volumes:
+      - ./scripts/capture.sh:/capture.sh
+      - ./data/pcaps:/data/pcaps
+      - ./logs:/var/log
+    entrypoint: /bin/sh
+    command: >
+      -c "
+        apk add --no-cache tcpdump bash &&
+        chmod +x /capture.sh &&
+        /capture.sh
+      "
+    environment:
+      - CAPTURE_INTERFACES=eth1 eth2 eth3
+      - ROTATION_INTERVAL=3600
+
+  feature-extractor:
+    image: python:3.10-slim
+    container_name: siem-feature
+    restart: unless-stopped
+    volumes:
+      - ./scripts/extract_features.py:/app/extract_features.py
+      - ./data/pcaps:/data/pcaps
+      - ./data/flows:/data/flows
+    working_dir: /app
+    command: >
+      bash -c "
+        pip install --no-cache-dir pandas numpy cicflowmeter watchdog &&
+        python extract_features.py
+      "
+    networks:
+      - siem-network
+    depends_on:
+      - pcap-capture
+
+  sequence-builder:
+    image: python:3.10-slim
+    container_name: siem-sequence
+    restart: unless-stopped
+    volumes:
+      - ./scripts/sequence_builder.py:/app/sequence_builder.py
+      - ./data/flows:/data/flows
+    working_dir: /app
+    command: >
+      bash -c "
+        pip install --no-cache-dir requests pandas numpy redis &&
+        python sequence_builder.py
+      "
+    networks:
+      - siem-network
+    depends_on:
+      - redis
+      - lstm-api
+      - feature-extractor
+    environment:
+      - LSTM_API=http://lstm-api:8001/predict
+      - BACKEND_API=http://backend-api:8000/predictions
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+
+  elasticsearch:
+    image: elasticsearch:8.11.0
+    container_name: siem-elastic
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - xpack.security.enabled=false
+    ports:
+      - "9200:9200"
+    volumes:
+      - elastic-data:/usr/share/elasticsearch/data
+    networks:
+      - siem-network
+
+  logstash:
+    image: logstash:8.11.0
+    container_name: siem-logstash
+    ports:
+      - "5044:5044"
+    volumes:
+      - ./configs/logstash/:/usr/share/logstash/pipeline/
+      - ./logs:/var/log
+    networks:
+      - siem-network
+    depends_on:
+      - elasticsearch
+
+  kibana:
+    image: kibana:8.11.0
+    container_name: siem-kibana
+    ports:
+      - "5601:5601"
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    networks:
+      - siem-network
+    depends_on:
+      - elasticsearch
+
+networks:
+  siem-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  elastic-data:
