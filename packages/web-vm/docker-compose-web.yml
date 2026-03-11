@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  dvwa:
+    image: vulnerables/web-dvwa:latest
+    container_name: dvwa
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      - DVWA_RECAPTCHA=disabled
+    networks:
+      - web_network
+
+  juice-shop:
+    image: bkimminich/juice-shop:latest
+    container_name: juice-shop
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    networks:
+      - web_network
+
+networks:
+  web_network:
+    driver: bridge
